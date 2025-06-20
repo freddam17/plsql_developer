@@ -1,0 +1,384 @@
+# .github/workflows/security-scan.yml
+name: 🔒 Security Scan Complete
+
+on:
+  # Ejecutar en cada push a main y develop
+  push:
+    branches: [ main, develop ]
+  
+  # Ejecutar en cada PR
+  pull_request:
+    branches: [ main ]
+  
+  # Ejecutar según calendario (todos los días a las 2 AM)
+  schedule:
+    - cron: '0 2 * * *'
+  
+  # Permitir ejecución manual desde la UI de GitHub
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Tipo de escaneo a realizar'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - quick
+          - dependencies-only
+          - secrets-only
+          - code-only
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  # 1️⃣ Análisis de secretos expuestos
+  secret-scanning:
+    name: 🔍 Escaneo de Secretos
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'workflow_dispatch' || 
+      github.event.inputs.scan_type == 'full' || 
+      github.event.inputs.scan_type == 'secrets-only'
+    
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Necesario para escanear todo el historial
+      
+      - name: 🔍 TruffleHog - Buscar secretos en el código
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+      
+      - name: 🔍 GitLeaks - Detectar secretos
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 📤 Subir reporte de secretos
+        uses: actions/upload-artifact@v3
+        if: failure()
+        with:
+          name: secrets-report
+          path: |
+            gitleaks-report.json
+            trufflehog-report.json
+
+  # 2️⃣ Análisis de vulnerabilidades en dependencias
+  dependency-check:
+    name: 📦 Análisis de Dependencias
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'workflow_dispatch' || 
+      github.event.inputs.scan_type == 'full' || 
+      github.event.inputs.scan_type == 'dependencies-only'
+    
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+      
+      - name: 🔍 Detectar tipo de proyecto
+        id: detect-project
+        run: |
+          if [ -f "package.json" ]; then
+            echo "project_type=node" >> $GITHUB_OUTPUT
+          elif [ -f "requirements.txt" ] || [ -f "setup.py" ]; then
+            echo "project_type=python" >> $GITHUB_OUTPUT
+          elif [ -f "pom.xml" ]; then
+            echo "project_type=maven" >> $GITHUB_OUTPUT
+          elif [ -f "build.gradle" ]; then
+            echo "project_type=gradle" >> $GITHUB_OUTPUT
+          elif [ -f "go.mod" ]; then
+            echo "project_type=go" >> $GITHUB_OUTPUT
+          else
+            echo "project_type=unknown" >> $GITHUB_OUTPUT
+          fi
+      
+      # Node.js Dependencies
+      - name: 🟢 Audit Node.js dependencies
+        if: steps.detect-project.outputs.project_type == 'node'
+        run: |
+          npm audit --json > npm-audit.json || true
+          npx audit-ci --moderate || true
+          
+      - name: 🛡️ Snyk para Node.js
+        if: steps.detect-project.outputs.project_type == 'node' && env.SNYK_TOKEN != ''
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+      
+      # Python Dependencies
+      - name: 🐍 Safety check para Python
+        if: steps.detect-project.outputs.project_type == 'python'
+        run: |
+          pip install safety
+          safety check --json > safety-report.json || true
+          
+      - name: 🐍 Pip-audit para Python
+        if: steps.detect-project.outputs.project_type == 'python'
+        run: |
+          pip install pip-audit
+          pip-audit --desc --format json > pip-audit.json || true
+      
+      # OWASP Dependency Check (Universal)
+      - name: 🛡️ OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: '${{ github.repository }}'
+          path: '.'
+          format: 'ALL'
+          args: >
+            --enableRetired
+            --enableExperimental
+      
+      - name: 📤 Subir reportes de dependencias
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: dependency-reports
+          path: |
+            **/npm-audit.json
+            **/safety-report.json
+            **/pip-audit.json
+            **/dependency-check-report.*
+
+  # 3️⃣ Análisis estático de código (SAST)
+  code-analysis:
+    name: 🔍 Análisis de Código (SAST)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'workflow_dispatch' || 
+      github.event.inputs.scan_type == 'full' || 
+      github.event.inputs.scan_type == 'code-only'
+    
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: 🔍 Inicializar CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: 'javascript,python,java,go,csharp,cpp'
+          queries: security-extended,security-and-quality
+      
+      - name: 🔨 Autobuild
+        uses: github/codeql-action/autobuild@v2
+      
+      - name: 🔍 Ejecutar análisis CodeQL
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: "/language:${{matrix.language}}"
+      
+      - name: 🛡️ Semgrep - Análisis SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+            p/r2c-security-audit
+          generateSarif: true
+      
+      - name: 📤 Subir resultados Semgrep a GitHub
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+  # 4️⃣ Análisis de contenedores
+  container-scan:
+    name: 🐳 Escaneo de Contenedores
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name != 'workflow_dispatch' || 
+      github.event.inputs.scan_type == 'full') && 
+      (contains(github.event.head_commit.modified, 'Dockerfile') || 
+      contains(github.event.head_commit.modified, 'docker-compose'))
+    
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+      
+      - name: 🔍 Buscar Dockerfiles
+        id: find-dockerfiles
+        run: |
+          echo "dockerfiles=$(find . -name 'Dockerfile*' -type f | tr '\n' ' ')" >> $GITHUB_OUTPUT
+      
+      - name: 🐳 Hadolint - Lint Dockerfile
+        if: steps.find-dockerfiles.outputs.dockerfiles != ''
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+      
+      - name: 🛡️ Trivy - Escanear vulnerabilidades
+        if: steps.find-dockerfiles.outputs.dockerfiles != ''
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      
+      - name: 📤 Subir resultados Trivy
+        uses: github/codeql-action/upload-sarif@v2
+        if: steps.find-dockerfiles.outputs.dockerfiles != ''
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # 5️⃣ Análisis de infraestructura como código
+  iac-scan:
+    name: 🏗️ Escaneo IaC
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'workflow_dispatch' || 
+      github.event.inputs.scan_type == 'full'
+    
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+      
+      - name: 🔍 Checkov - Análisis de IaC
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          quiet: false
+          soft_fail: true
+          framework: all
+          output_format: sarif
+          output_file_path: ./checkov.sarif
+      
+      - name: 📤 Subir resultados Checkov
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: checkov.sarif
+
+  # 6️⃣ Generar reporte consolidado
+  security-report:
+    name: 📊 Generar Reporte de Seguridad
+    runs-on: ubuntu-latest
+    needs: [secret-scanning, dependency-check, code-analysis, container-scan, iac-scan]
+    if: always()
+    
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+      
+      - name: 📥 Descargar todos los artefactos
+        uses: actions/download-artifact@v3
+        with:
+          path: security-artifacts
+      
+      - name: 📊 Generar reporte consolidado
+        run: |
+          mkdir -p security-reports
+          echo "# 🔒 Reporte de Seguridad" > security-reports/SECURITY-REPORT.md
+          echo "**Fecha:** $(date)" >> security-reports/SECURITY-REPORT.md
+          echo "**Repositorio:** ${{ github.repository }}" >> security-reports/SECURITY-REPORT.md
+          echo "**Rama:** ${{ github.ref }}" >> security-reports/SECURITY-REPORT.md
+          echo "**Commit:** ${{ github.sha }}" >> security-reports/SECURITY-REPORT.md
+          echo "" >> security-reports/SECURITY-REPORT.md
+          
+          echo "## 📊 Resumen de Escaneos" >> security-reports/SECURITY-REPORT.md
+          echo "" >> security-reports/SECURITY-REPORT.md
+          
+          # Agregar estado de cada job
+          echo "| Escaneo | Estado |" >> security-reports/SECURITY-REPORT.md
+          echo "|---------|--------|" >> security-reports/SECURITY-REPORT.md
+          echo "| Secretos | ${{ needs.secret-scanning.result }} |" >> security-reports/SECURITY-REPORT.md
+          echo "| Dependencias | ${{ needs.dependency-check.result }} |" >> security-reports/SECURITY-REPORT.md
+          echo "| Código (SAST) | ${{ needs.code-analysis.result }} |" >> security-reports/SECURITY-REPORT.md
+          echo "| Contenedores | ${{ needs.container-scan.result }} |" >> security-reports/SECURITY-REPORT.md
+          echo "| IaC | ${{ needs.iac-scan.result }} |" >> security-reports/SECURITY-REPORT.md
+          
+          # Script para procesar reportes JSON
+          cat > process_reports.py << 'EOF'
+          import json
+          import os
+          import glob
+          
+          def process_json_reports():
+              report_content = "\n## 🔍 Detalles de Vulnerabilidades\n\n"
+              
+              # Procesar npm-audit
+              npm_files = glob.glob('security-artifacts/**/npm-audit.json', recursive=True)
+              if npm_files:
+                  report_content += "### 📦 NPM Audit\n"
+                  for file in npm_files:
+                      try:
+                          with open(file, 'r') as f:
+                              data = json.load(f)
+                              if 'vulnerabilities' in data:
+                                  report_content += f"- Total vulnerabilidades: {data['metadata']['vulnerabilities']['total']}\n"
+                                  report_content += f"  - Críticas: {data['metadata']['vulnerabilities']['critical']}\n"
+                                  report_content += f"  - Altas: {data['metadata']['vulnerabilities']['high']}\n"
+                      except:
+                          pass
+              
+              return report_content
+          
+          # Generar contenido adicional
+          additional_content = process_json_reports()
+          with open('security-reports/SECURITY-REPORT.md', 'a') as f:
+              f.write(additional_content)
+          EOF
+          
+          python process_reports.py || true
+      
+      - name: 📤 Subir reporte final
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-report-final
+          path: security-reports/
+      
+      - name: 💬 Comentar en PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('security-reports/SECURITY-REPORT.md', 'utf8');
+            
+            // Buscar comentario existente
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && comment.body.includes('🔒 Reporte de Seguridad')
+            );
+            
+            if (botComment) {
+              // Actualizar comentario existente
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: report
+              });
+            } else {
+              // Crear nuevo comentario
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: report
+              });
+            }
