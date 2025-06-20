@@ -1,0 +1,61 @@
+# .github/workflows/security-notifications.yml
+name: 🔔 Notificaciones de Seguridad
+
+on:
+  workflow_run:
+    workflows: ["🔒 Security Scan Complete"]
+    types:
+      - completed
+
+jobs:
+  notify:
+    name: 📢 Enviar Notificaciones
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    
+    steps:
+      - name: 📧 Notificar por Email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: ⚠️ Alerta de Seguridad - ${{ github.repository }}
+          to: security@tudominio.com
+          from: GitHub Actions
+          body: |
+            Se han detectado problemas de seguridad en ${{ github.repository }}.
+            
+            Detalles:
+            - Repositorio: ${{ github.repository }}
+            - Rama: ${{ github.event.workflow_run.head_branch }}
+            - Commit: ${{ github.event.workflow_run.head_sha }}
+            
+            Ver detalles completos: ${{ github.event.workflow_run.html_url }}
+      
+      - name: 💬 Notificar en Slack
+        if: env.SLACK_WEBHOOK != ''
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "⚠️ Alerta de Seguridad",
+              attachments: [{
+                color: 'danger',
+                text: `Se detectaron vulnerabilidades en ${process.env.AS_REPO}`,
+                fields: [{
+                  title: 'Repositorio',
+                  value: process.env.AS_REPO,
+                  short: true
+                },
+                {
+                  title: 'Ver Detalles',
+                  value: process.env.AS_WORKFLOW_RUN_URL,
+                  short: true
+                }]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
